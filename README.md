@@ -150,3 +150,7 @@ source repositories were not modified. Results:
   way, a non-empty `-Output` folder, and a repository that isn't in
   Workspace mode. `-MovePblsTo` moved the `.pbl` file aside and the
   migration then completed.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
