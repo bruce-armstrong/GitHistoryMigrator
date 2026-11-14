@@ -12,7 +12,8 @@ Two modes:
                 git sees each move as a 100% rename;
              2. a conversion commit: the export headers are rewritten, the
                 .pbw/.pbt files become .pbsln/.pbproj files, each library gets a
-                .pblmeta file, and the binary .pbl files are removed.
+                .pblmeta file, and a .gitignore pattern such as *.pbl gets a
+                !*.pbl/ negation so the new .pbl folders aren't ignored.
            Existing commits, branches and hashes are untouched.
 
   rewrite  Builds a NEW repository in which every commit of the source
@@ -227,6 +228,42 @@ def is_pbl_file(path):
     return path.lower().endswith(".pbl")
 
 
+def is_gitignore(path):
+    return path.split("/")[-1] == ".gitignore"
+
+
+GITIGNORE_NOTE = "# Solution mode: .pbl entries are source folders, not binary libraries"
+
+
+def fix_gitignore(data):
+    """A Workspace-mode .gitignore usually ignores the binary libraries with a
+    pattern such as *.pbl. In Solution mode that pattern matches the .pbl
+    source folders, so git would ignore every object added to them. For each
+    such pattern, add a negation that re-includes the folders (a trailing /
+    matches only directories): *.pbl  ->  !*.pbl/
+    Returns the new content, or the same bytes if nothing needed changing.
+    Works on bytes, so the existing content is never re-encoded."""
+    body = data[3:] if data.startswith(BOM) else data
+    lines = [l.strip(b" \t\r\n\v\f") for l in body.split(b"\n")]
+    have = set(lines)
+    add = []
+    for p in lines:
+        if not p or p.startswith((b"#", b"!")) or p.endswith(b"/"):
+            continue
+        if p.lower().endswith(b".pbl"):
+            neg = b"!" + p + b"/"
+            if neg not in have and neg not in add:
+                add.append(neg)
+    if not add:
+        return data
+    note = GITIGNORE_NOTE.encode("utf-8")
+    if note not in have:
+        add.insert(0, note)
+    nl = b"\r\n" if b"\r\n" in data else b"\n"
+    sep = nl if body and not data.endswith((b"\n", b"\r")) else b""
+    return data + sep + nl.join(add) + nl
+
+
 # --------------------------------------------------------------------------
 # git helpers
 # --------------------------------------------------------------------------
@@ -257,24 +294,41 @@ def commit(repo, message):
 # --ide-output overlay
 # --------------------------------------------------------------------------
 
+def _rel(p):
+    return os.path.normpath(p).replace(os.sep, "/")
+
+
+def resolve_case(root, rel):
+    """Spell a relative path the way it exists below root. PowerBuilder paths
+    are case-insensitive (a .pbsln may say pbl\\x.pbproj for a PBL folder),
+    but git pathspecs and non-Windows file systems are not. Components that
+    don't exist are kept as given."""
+    out, cur = [], root
+    for part in rel.split("/"):
+        hit = part
+        names = os.listdir(cur) if os.path.isdir(cur) else []
+        if part not in names:
+            hit = next((n for n in names if n.lower() == part.lower()), part)
+        out.append(hit)
+        cur = os.path.join(cur, hit)
+    return "/".join(out)
+
+
 def solution_files(ide_dir):
     """The files that make up the solution in the IDE's output folder: the
     .pbsln at its root, the .pbproj files it lists, and every file in the
     library folders those projects use. Build output (which also contains
-    .pbl folders) is not part of it."""
+    .pbl folders) is not part of it. Paths are spelled as they exist on disk."""
     slns = [f for f in os.listdir(ide_dir) if f.lower().endswith(".pbsln")]
     if not slns:
         sys.exit("--ide-output %s has no .pbsln file at its root." % ide_dir)
     files, libdirs = set(), set()
 
-    def rel(p):
-        return os.path.normpath(p).replace(os.sep, "/")
-
     for sln in slns:
         files.add(sln)
         text = _decode(open(os.path.join(ide_dir, sln), "rb").read())
         for proj in re.findall(r'<Project\s+Path="([^"]+)"', text):
-            proj = rel(proj.replace("\\", "/"))
+            proj = resolve_case(ide_dir, _rel(proj.replace("\\", "/")))
             full = os.path.join(ide_dir, proj)
             if not os.path.isfile(full):
                 continue
@@ -282,28 +336,31 @@ def solution_files(ide_dir):
             ptext = _decode(open(full, "rb").read())
             base = os.path.dirname(proj)
             for lib in re.findall(r'(?:Library Path|AppEntry)="([^"]+)"', ptext):
-                libdirs.add(rel(os.path.join(base, lib.replace("\\", "/"))))
+                libdirs.add(resolve_case(ide_dir, _rel(os.path.join(base, lib.replace("\\", "/")))))
     for d in libdirs:
         for root, _dirs, fs in os.walk(os.path.join(ide_dir, d)):
             for f in fs:
-                files.add(rel(os.path.relpath(os.path.join(root, f), ide_dir)))
+                files.add(_rel(os.path.relpath(os.path.join(root, f), ide_dir)))
     return sorted(files)
 
 
 def overlay_ide_output(repo, ide_dir, mapped_libdirs):
-    """Copy the IDE's solution files (see solution_files) into the repo.
-    Returns (changed paths, repo files in .pbl folders the IDE did not write)."""
-    candidates = solution_files(ide_dir)
+    """Copy the IDE's solution files (see solution_files) into the repo, each
+    at the spelling the repository already uses for it.
+    Returns (changed paths, repo files in .pbl folders the IDE did not write,
+    IDE files skipped because the repository's .gitignore excludes them)."""
+    targets = [(src, resolve_case(repo, src)) for src in solution_files(ide_dir)]
     ignored = set(git(repo, "check-ignore", "--no-index", "-z", "--stdin",
-                      input=b"\0".join(c.encode("utf-8") for c in candidates) + b"\0",
+                      input=b"\0".join(d.encode("utf-8") for _s, d in targets) + b"\0",
                       check=False).decode("utf-8").split("\0"))
-    changed, seen = [], set()
-    for rel in candidates:
+    changed, skipped, seen = [], [], set()
+    for src, rel in targets:
         if rel in ignored:
+            skipped.append(rel)
             continue
         seen.add(rel.lower())
         dst = os.path.join(repo, rel)
-        new = open(os.path.join(ide_dir, rel), "rb").read()
+        new = open(os.path.join(ide_dir, src), "rb").read()
         if os.path.isfile(dst) and open(dst, "rb").read() == new:
             continue
         os.makedirs(os.path.dirname(dst) or repo, exist_ok=True)
@@ -318,7 +375,7 @@ def overlay_ide_output(repo, ide_dir, mapped_libdirs):
                 rel = libdir + "/" + f
                 if rel.lower() not in seen:
                     leftovers.append(rel)
-    return changed, leftovers
+    return changed, leftovers, skipped
 
 
 def stage_paths(repo, paths):
@@ -437,6 +494,12 @@ def run_inplace(args):
             _write(repo, out, convert_pbt(data, exists))
             git(repo, "rm", "-q", "--", p)
             touched.append(out)
+        elif is_gitignore(p):
+            data = open(os.path.join(repo, p), "rb").read()
+            fixed = fix_gitignore(data)
+            if fixed != data:
+                _write(repo, p, fixed)
+                touched.append(p)
     for d in libdirs:
         meta = pblmeta_path(d)
         if not os.path.exists(os.path.join(repo, meta)):
@@ -450,9 +513,9 @@ def run_inplace(args):
                   "folder gets a .pblmeta file.")
 
     # ---- optional commit 3: the IDE's own output -------------------------
-    sha3, leftovers = None, []
+    sha3, leftovers, skipped = None, [], []
     if args.ide_output:
-        changed, leftovers = overlay_ide_output(repo, args.ide_output, libdirs)
+        changed, leftovers, skipped = overlay_ide_output(repo, args.ide_output, libdirs)
         stage_paths(repo, changed)
         if git_text(repo, "diff", "--cached", "--name-only"):
             sha3 = commit(repo, "Apply PowerBuilder's own Solution migration output")
@@ -467,7 +530,7 @@ def run_inplace(args):
     print("Commit 2 (conversion): %s  %d files written" % (sha2[:10], len(touched)))
     if sha3:
         print("Commit 3 (IDE output): %s" % sha3[:10])
-    _report(unmapped, binary_objs if not args.ide_output else [], utf16_objs, leftovers)
+    _report(unmapped, binary_objs if not args.ide_output else [], utf16_objs, leftovers, skipped)
     print("\nNothing was pushed. Review with:  git log --stat -3   and, for any object,"
           "\n  git log --follow -- \"%s\"" % sorted(mapping.values())[0])
 
@@ -490,7 +553,7 @@ def _prune_empty_dirs(repo, dirs):
                 break
 
 
-def _report(unmapped, binary_objs, utf16_objs, leftovers):
+def _report(unmapped, binary_objs, utf16_objs, leftovers, skipped=()):
     if unmapped:
         print("\nFiles under ws_objects outside any .pbl.src folder were left as they are:")
         for p in unmapped[:20]:
@@ -509,6 +572,12 @@ def _report(unmapped, binary_objs, utf16_objs, leftovers):
             print("  " + p)
         if len(leftovers) > 20:
             print("  ... and %d more" % (len(leftovers) - 20))
+    if skipped:
+        print("\nIDE output files skipped because the repository's .gitignore excludes them:")
+        for p in skipped[:20]:
+            print("  " + p)
+        if len(skipped) > 20:
+            print("  ... and %d more" % (len(skipped) - 20))
 
 
 # --------------------------------------------------------------------------
@@ -661,17 +730,19 @@ def run_rewrite(args):
     print("  %d object versions converted, %d renamed only, %d .pbl binaries dropped,"
           " %d .pbt and %d .pbw converted"
           % (stats["converted"], stats["renamed"], stats["pbl"], stats["pbt"], stats["pbw"]))
+    if stats["gitignore"]:
+        print("  %d .gitignore versions now re-include the .pbl folders" % stats["gitignore"])
     print("  Old -> new commit hashes: %s" % mapfile)
 
     if args.ide_output:
         libdirs = {library_dir(p) for p in
                    git_text(out, "ls-files").splitlines() if library_dir(p)}
-        changed, leftovers = overlay_ide_output(out, args.ide_output, libdirs)
+        changed, leftovers, skipped = overlay_ide_output(out, args.ide_output, libdirs)
         stage_paths(out, changed)
         if git_text(out, "diff", "--cached", "--name-only"):
             sha = commit(out, "Apply PowerBuilder's own Solution migration output")
             print("  Added the IDE output as %s" % sha[:10])
-        _report([], [], [], leftovers)
+        _report([], [], [], leftovers, skipped)
     else:
         cur = {p for p in binary_objs
                if os.path.exists(os.path.join(out, p.decode("utf-8")))}
@@ -714,6 +785,13 @@ def _rewrite_op(line, blobs, stats, binary_objs, libdirs):
                 data, ext = convert_pbw(data), ".pbsln"
             npath = _quote(_swap_ext(p, ext).encode("utf-8"))
             return [b"M 100644 inline " + npath + b"\ndata %d\n" % len(data) + data + b"\n"]
+        if is_gitignore(p):
+            data = blobs.read(ref)
+            fixed = fix_gitignore(data)
+            if fixed != data:
+                stats["gitignore"] += 1
+                return [b"M " + mode + b" inline " + _quote(path)
+                        + b"\ndata %d\n" % len(fixed) + fixed + b"\n"]
         return [line]
     if line.startswith(b"D "):
         path = _unquote(line[2:].rstrip(b"\n"))

@@ -13,7 +13,8 @@
                   move as a 100% rename;
                2. a conversion commit: export headers rewritten, .pbw/.pbt files
                   replaced by .pbsln/.pbproj files, a .pblmeta file per library,
-                  binary .pbl files removed.
+                  and a !*.pbl/ negation after any .gitignore pattern such as
+                  *.pbl, so the new .pbl folders aren't ignored.
              Existing commits, branches and hashes are untouched.
 
     rewrite  Builds a NEW repository in which every commit is rewritten as if
@@ -74,6 +75,7 @@ $script:SourceExts = @('.sra', '.srd', '.srf', '.srj', '.srm', '.srp', '.srq', '
 $script:PblVersion = '250'                                            # PowerBuilder 2025
 $script:PblComment = 'Created from Source Control Refresh Operation'  # what the IDE writes
 $script:Ord = [StringComparison]::Ordinal
+$script:GitignoreNote = '# Solution mode: .pbl entries are source folders, not binary libraries'
 
 function Stop-Migration([string]$Message) {
     [Console]::Error.WriteLine($Message)
@@ -372,6 +374,37 @@ function New-Pblmeta([string]$Eol = "`r`n") {
     , (Join-Bom $script:Utf8.GetBytes($text))
 }
 
+function Test-Gitignore([string]$Path) {
+    ($Path -ceq '.gitignore') -or $Path.EndsWith('/.gitignore', $script:Ord)
+}
+
+function Repair-Gitignore([string]$Text) {
+    # A Workspace-mode .gitignore usually ignores the binary libraries with a
+    # pattern such as *.pbl. In Solution mode that pattern matches the .pbl
+    # source folders, so git would ignore every object added to them. For each
+    # such pattern, add a negation that re-includes the folders (a trailing /
+    # matches only directories): *.pbl  ->  !*.pbl/
+    # Latin-1 string in and out; returns $Text unchanged if nothing is needed.
+    $body = if (Test-Prefix $Text $script:BOM) { $Text.Substring(3) } else { $Text }
+    $ws = [char[]]" `t`r`n`v`f"
+    $lines = @($body.Split("`n") | ForEach-Object { $_.Trim($ws) })
+    $have = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($l in $lines) { [void]$have.Add($l) }
+    $add = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $lines) {
+        if (-not $p -or (Test-Prefix $p '#') -or (Test-Prefix $p '!') -or $p.EndsWith('/', $script:Ord)) { continue }
+        if (Test-Suffix $p '.pbl') {
+            $neg = '!' + $p + '/'
+            if (-not $have.Contains($neg) -and -not $add.Contains($neg)) { $add.Add($neg) }
+        }
+    }
+    if ($add.Count -eq 0) { return $Text }
+    if (-not $have.Contains($script:GitignoreNote)) { $add.Insert(0, $script:GitignoreNote) }
+    $nl = Get-Eol $Text
+    $sep = if ($body -and $Text[-1] -ne "`n" -and $Text[-1] -ne "`r") { $nl } else { '' }
+    $Text + $sep + ($add -join $nl) + $nl
+}
+
 # --------------------------------------------------------------------------
 # -IdeOutput overlay
 # --------------------------------------------------------------------------
@@ -387,10 +420,38 @@ function ConvertTo-RelPath([string]$Path) {
     $stack -join '/'
 }
 
+function Resolve-Case([string]$Root, [string]$Rel, $Cache) {
+    # Spell a relative path the way it exists below $Root. PowerBuilder paths
+    # are case-insensitive (a .pbsln may say pbl\x.pbproj for a PBL folder),
+    # but git pathspecs and non-Windows file systems are not. Components that
+    # don't exist are kept as given. $Cache: folder -> names in it.
+    $out = New-Object System.Collections.Generic.List[string]
+    $cur = $Root
+    foreach ($part in $Rel.Split('/')) {
+        if (-not $Cache.ContainsKey($cur)) {
+            $names = New-Object System.Collections.Generic.List[string]
+            if ([IO.Directory]::Exists($cur)) {
+                foreach ($e in [IO.Directory]::GetFileSystemEntries($cur)) { $names.Add([IO.Path]::GetFileName($e)) }
+            }
+            $Cache[$cur] = $names
+        }
+        $hit = $part
+        if (-not $Cache[$cur].Contains($part)) {
+            foreach ($n in $Cache[$cur]) {
+                if ($n.ToLowerInvariant() -ceq $part.ToLowerInvariant()) { $hit = $n; break }
+            }
+        }
+        $out.Add($hit)
+        $cur = [IO.Path]::Combine($cur, $hit)
+    }
+    $out -join '/'
+}
+
 function Get-SolutionFiles([string]$IdeDir) {
     # The .pbsln at the folder's root, the .pbproj files it lists, and every
     # file in the library folders those projects use. Build output (which also
-    # contains .pbl folders) is not part of it.
+    # contains .pbl folders) is not part of it. Paths are spelled as on disk.
+    $cache = @{}
     $slns = @([IO.Directory]::GetFiles($IdeDir) | Where-Object { Test-Suffix $_ '.pbsln' })
     if ($slns.Count -eq 0) { Stop-Migration "-IdeOutput $IdeDir has no .pbsln file at its root." }
     $files = New-Object 'System.Collections.Generic.SortedSet[string]' ([StringComparer]::Ordinal)
@@ -399,14 +460,14 @@ function Get-SolutionFiles([string]$IdeDir) {
         [void]$files.Add([IO.Path]::GetFileName($sln))
         $text = ConvertFrom-FileBytes ([IO.File]::ReadAllBytes($sln))
         foreach ($m in [regex]::Matches($text, '<Project\s+Path="([^"]+)"')) {
-            $proj = ConvertTo-RelPath $m.Groups[1].Value
+            $proj = Resolve-Case $IdeDir (ConvertTo-RelPath $m.Groups[1].Value) $cache
             $full = [IO.Path]::Combine($IdeDir, $proj)
             if (-not [IO.File]::Exists($full)) { continue }
             [void]$files.Add($proj)
             $ptext = ConvertFrom-FileBytes ([IO.File]::ReadAllBytes($full))
             $base = [IO.Path]::GetDirectoryName($proj)
             foreach ($lm in [regex]::Matches($ptext, '(?:Library Path|AppEntry)="([^"]+)"')) {
-                [void]$libdirs.Add((ConvertTo-RelPath ($base + '/' + $lm.Groups[1].Value)))
+                [void]$libdirs.Add((Resolve-Case $IdeDir (ConvertTo-RelPath ($base + '/' + $lm.Groups[1].Value)) $cache))
             }
         }
     }
@@ -422,19 +483,24 @@ function Get-SolutionFiles([string]$IdeDir) {
 }
 
 function Copy-IdeOutput([string]$RepoPath, [string]$IdeDir, $MappedLibDirs) {
-    # Returns .Changed (paths written) and .Leftovers (files in .pbl folders the
-    # IDE did not write).
+    # Copies each IDE file to the spelling the repository already uses for it.
+    # Returns .Changed (paths written), .Leftovers (files in .pbl folders the
+    # IDE did not write) and .Skipped (IDE files the .gitignore excludes).
+    $cache = @{}
     $candidates = Get-SolutionFiles $IdeDir
-    $r = Invoke-Git $RepoPath @('check-ignore', '--no-index', '-z', '--stdin') -InputBytes (ConvertTo-NulList $candidates) -AllowFail
+    $targets = @($candidates | ForEach-Object { , @($_, (Resolve-Case $RepoPath $_ $cache)) })
+    $r = Invoke-Git $RepoPath @('check-ignore', '--no-index', '-z', '--stdin') -InputBytes (ConvertTo-NulList @($targets | ForEach-Object { $_[1] })) -AllowFail
     $ignored = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
     foreach ($p in $script:Utf8.GetString($r.Out).Split([char]0)) { if ($p) { [void]$ignored.Add($p) } }
     $changed = New-Object System.Collections.Generic.List[string]
+    $skipped = New-Object System.Collections.Generic.List[string]
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($rel in $candidates) {
-        if ($ignored.Contains($rel)) { continue }
+    foreach ($t in $targets) {
+        $src, $rel = $t[0], $t[1]
+        if ($ignored.Contains($rel)) { $skipped.Add($rel); continue }
         [void]$seen.Add($rel)
         $dst = [IO.Path]::Combine($RepoPath, $rel)
-        $new = [IO.File]::ReadAllBytes([IO.Path]::Combine($IdeDir, $rel))
+        $new = [IO.File]::ReadAllBytes([IO.Path]::Combine($IdeDir, $src))
         if ([IO.File]::Exists($dst)) {
             $old = [IO.File]::ReadAllBytes($dst)
             if ($old.Length -eq $new.Length -and [Convert]::ToBase64String($old) -eq [Convert]::ToBase64String($new)) { continue }
@@ -452,10 +518,15 @@ function Copy-IdeOutput([string]$RepoPath, [string]$IdeDir, $MappedLibDirs) {
             if (-not $seen.Contains($rel)) { $leftovers.Add($rel) }
         }
     }
-    [pscustomobject]@{ Changed = $changed; Leftovers = $leftovers }
+    [pscustomobject]@{ Changed = $changed; Leftovers = $leftovers; Skipped = $skipped }
 }
 
-function Write-Report($Unmapped, $BinaryObjs, [int]$Utf16Count, $Leftovers) {
+function Write-Report($Unmapped, $BinaryObjs, [int]$Utf16Count, $Leftovers, $Skipped = @()) {
+    # Drop $null entries: "if (...) { @() }" yields $null, and @($null).Count is 1.
+    $Unmapped = @($Unmapped | Where-Object { $_ })
+    $BinaryObjs = @($BinaryObjs | Where-Object { $_ })
+    $Leftovers = @($Leftovers | Where-Object { $_ })
+    $Skipped = @($Skipped | Where-Object { $_ })
     if (@($Unmapped).Count) {
         Write-Host "`nFiles under ws_objects outside any .pbl.src folder were left as they are:"
         @($Unmapped) | Select-Object -First 20 | ForEach-Object { Write-Host "  $_" }
@@ -471,6 +542,11 @@ function Write-Report($Unmapped, $BinaryObjs, [int]$Utf16Count, $Leftovers) {
         Write-Host "`nFiles in .pbl folders that the IDE output does not contain (kept):"
         @($Leftovers) | Select-Object -First 20 | ForEach-Object { Write-Host "  $_" }
         if (@($Leftovers).Count -gt 20) { Write-Host ("  ... and {0} more" -f (@($Leftovers).Count - 20)) }
+    }
+    if (@($Skipped).Count) {
+        Write-Host "`nIDE output files skipped because the repository's .gitignore excludes them:"
+        @($Skipped) | Select-Object -First 20 | ForEach-Object { Write-Host "  $_" }
+        if (@($Skipped).Count -gt 20) { Write-Host ("  ... and {0} more" -f (@($Skipped).Count - 20)) }
     }
 }
 
@@ -607,6 +683,13 @@ function Invoke-Inplace {
             Write-RepoFile $repoPath $out (Convert-Pbt $bytes $base)
             $null = Invoke-Git $repoPath @('rm', '-q', '--', $p)
             $touched.Add($out)
+        } elseif (Test-Gitignore $p) {
+            $text = $script:L1.GetString([IO.File]::ReadAllBytes([IO.Path]::Combine($repoPath, $p)))
+            $fixed = Repair-Gitignore $text
+            if ($fixed -cne $text) {
+                Write-RepoFile $repoPath $p $script:L1.GetBytes($fixed)
+                $touched.Add($p)
+            }
         }
     }
     foreach ($d in $libdirs) {
@@ -627,9 +710,11 @@ function Invoke-Inplace {
     # ---- optional commit 3: the IDE's own output --------------------------
     $sha3 = $null
     $leftovers = @()
+    $skipped = @()
     if ($IdeOutput) {
         $ide = Copy-IdeOutput $repoPath (Resolve-UserPath $IdeOutput) $libdirs
         $leftovers = $ide.Leftovers
+        $skipped = $ide.Skipped
         Add-GitPaths $repoPath $ide.Changed
         if (Get-GitText $repoPath @('diff', '--cached', '--name-only')) {
             $sha3 = New-GitCommit $repoPath "Apply PowerBuilder's own Solution migration output"
@@ -644,7 +729,7 @@ function Invoke-Inplace {
     Write-Host ("Commit 2 (conversion): {0}  {1} files written" -f $sha2.Substring(0, 10), $touched.Count)
     if ($sha3) { Write-Host ("Commit 3 (IDE output): {0}" -f $sha3.Substring(0, 10)) }
     $bin = if ($IdeOutput) { @() } else { $binaryObjs }
-    Write-Report $unmapped $bin $utf16 $leftovers
+    Write-Report $unmapped $bin $utf16 $leftovers $skipped
     $example = @($mapping.Values | Sort-Object)[0]
     Write-Host "`nNothing was pushed. Review with:  git log --stat -3   and, for any object,"
     Write-Host "  git log --follow -- `"$example`""
@@ -776,6 +861,14 @@ function Convert-Op([string]$Line, $Cat, $Stats, $BinaryObjs, $LibDirs) {
             else { $Stats.pbw++; $out = Convert-Pbw $bytes; $ext = '.pbsln' }
             return (Format-Inline (Set-Ext $p $ext) $script:L1.GetString($out))
         }
+        if (Test-Gitignore $p) {
+            $text = Read-Blob $Cat $ref
+            $fixed = Repair-Gitignore $text
+            if ($fixed -cne $text) {
+                $Stats.gitignore++
+                return "M $mode inline $(ConvertTo-GitQuoted $p)`ndata $($fixed.Length)`n$fixed`n"
+            }
+        }
         return $Line
     }
     if (Test-Prefix $Line 'D ') {
@@ -817,7 +910,7 @@ function Invoke-Rewrite {
     $r = [ByteReader]::new($exp.StandardOutput.BaseStream)
     $w = New-Object IO.BufferedStream($imp.StandardInput.BaseStream, 1048576)
     $L1 = $script:L1
-    $stats = @{ commits = 0; converted = 0; renamed = 0; pbl = 0; pbt = 0; pbw = 0 }
+    $stats = @{ commits = 0; converted = 0; renamed = 0; pbl = 0; pbt = 0; pbw = 0; gitignore = 0 }
     $binaryObjs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
     $origIds = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
 
@@ -898,6 +991,7 @@ function Invoke-Rewrite {
     Write-Host ("Rewrote {0} commits into {1} (checked out {2})" -f $stats.commits, $out, $headRef)
     Write-Host ("  {0} object versions converted, {1} renamed only, {2} .pbl binaries dropped, {3} .pbt and {4} .pbw converted" -f
                 $stats.converted, $stats.renamed, $stats.pbl, $stats.pbt, $stats.pbw)
+    if ($stats.gitignore) { Write-Host "  $($stats.gitignore) .gitignore versions now re-include the .pbl folders" }
     Write-Host "  Old -> new commit hashes: $mapFile"
 
     if ($IdeOutput) {
@@ -910,7 +1004,7 @@ function Invoke-Rewrite {
             $sha = New-GitCommit $out "Apply PowerBuilder's own Solution migration output"
             Write-Host ("  Added the IDE output as {0}" -f $sha.Substring(0, 10))
         }
-        Write-Report @() @() 0 $leftovers
+        Write-Report @() @() 0 $leftovers $ide.Skipped
     } else {
         $still = @($binaryObjs | Sort-Object | Where-Object {
             [IO.File]::Exists([IO.Path]::Combine($out, (ConvertFrom-L1Path $_))) } |

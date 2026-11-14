@@ -86,9 +86,28 @@ workspace in the IDE, then pass the folder it wrote:
 
 This adds one more commit, which makes the tree exactly match what the IDE
 produced. The tool takes the `.pbsln` at that folder's root, the `.pbproj`
-files it lists, and the library folders those projects use. Build output and
-anything your `.gitignore` excludes are skipped. Since the renames are already
+files it lists, and the library folders those projects use. Paths are matched
+without regard to case, as PowerBuilder does (a `.pbsln` that says
+`pbl\app.pbproj` finds a `PBL` folder), and each file keeps the spelling the
+repository already uses. Build output and anything your `.gitignore` excludes
+are skipped, and the skipped files are listed. Since the renames are already
 in commit 1, the history still follows.
+
+### `.gitignore` and `.pbl` folders
+
+A Workspace-mode `.gitignore` usually ignores the binary libraries with a
+pattern such as `*.pbl`. In Solution mode that same pattern matches the `.pbl`
+source folders, so git would silently ignore every new object. For each such
+pattern the tool appends a negation that matches only folders:
+
+```gitignore
+*.pbl
+# Solution mode: .pbl entries are source folders, not binary libraries
+!*.pbl/
+```
+
+Stray binary `.pbl` files stay ignored. In place, this is part of the
+conversion commit; in rewrite mode, every version of each `.gitignore` gets it.
 
 ## What each commit contains (inplace)
 
@@ -98,7 +117,8 @@ in commit 1, the history still follows.
 2. **Conversion.** The export headers are rewritten. Each `.pbw` becomes a
    `.pbsln` and each `.pbt` a `.pbproj`, with the default target, application,
    library list and deploy projects carried over. Each library folder gets a
-   `.pblmeta` file.
+   `.pblmeta` file. A `.gitignore` that would hide the `.pbl` folders is
+   fixed (see above).
 3. *(With `-IdeOutput` only.)* The IDE's files.
 
 The tool stops without changing anything if the repository has uncommitted
@@ -145,6 +165,11 @@ source repositories were not modified. Results:
   5.1 and on PowerShell 7, produced the same trees as `migrate.py` in every
   mode. In rewrite mode it also produced the same commit hashes for all 185
   commits.
+- **A second project** (73 commits, 1433 objects) whose `.gitignore` had
+  `*.pbl` and whose IDE-written `.pbsln` spelled the `PBL` folder `pbl`.
+  Python and Windows PowerShell 5.1, in both modes, produced the same final
+  tree, and rewrite mode produced the same commit hashes. The IDE output
+  was applied in full, with no files skipped or left over.
 - **Safety checks.** Each one stopped the tool before it created a branch:
   uncommitted changes, an existing branch, an untracked `.pbl` file in the
   way, a non-empty `-Output` folder, and a repository that isn't in
