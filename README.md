@@ -15,6 +15,43 @@ Both need git 2.23 or later. The examples below use `Migrate.ps1`. The
 Python options are the same in lowercase with dashes: `--ide-output`,
 `--move-pbls-to`, `--output`.
 
+## Use at your own risk
+
+> [!CAUTION]
+> This utility rewrites how your source code is stored, and in rewrite mode it
+> rewrites your whole git history. It comes with no warranty (see
+> [LICENSE](LICENSE)). You use it entirely at your own risk.
+
+**Back up before you start, and back up your backups.** Before you run the
+tool, make sure you have:
+
+- a copy of the repository on your hosting service (GitHub, Bitbucket, Azure
+  DevOps and so on) that you will not touch until you've checked the result;
+- a separate full copy, for example `git clone --mirror`, kept somewhere else
+  (another drive, another machine, or offline);
+- a copy of your PowerBuilder workspace folder itself, PBL files included.
+
+Run the tool on a fresh clone, never on your only working copy. Build and
+test the migrated project in the IDE before you push anything or ask your
+team to switch.
+
+**It hasn't been used widely yet.** So far it has been used on two real
+projects: one hosted on GitHub and one on Bitbucket. Your project may use
+PowerBuilder features, file layouts or git setups that those two didn't.
+
+**Please report problems.** If something goes wrong, or the result doesn't
+look right, please
+[open an issue](https://github.com/bruce-armstrong/GitHistoryMigrator/issues)
+so I can improve the utility. It helps to include:
+
+- the command you ran, and whether you used `Migrate.ps1` (with your
+  PowerShell version) or `migrate.py`;
+- the tool's full output;
+- your PowerBuilder and git versions;
+- what you expected, and what happened instead.
+
+Please leave out anything confidential from your source code.
+
 ## Why this works
 
 Each object maps one to one, and only its first lines change:
