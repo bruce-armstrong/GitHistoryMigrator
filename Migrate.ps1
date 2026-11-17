@@ -225,7 +225,8 @@ function Split-FirstLine([string]$s) {
 function Convert-Source([string]$Text, [string]$Path) {
     # $Text is Latin-1 (one char per byte). Returns the converted text and notes.
     # $PBExportHeader$<name>    is dropped
-    # $PBExportComments$<text>  becomes //objectcomments <text> (dropped for .srj)
+    # $PBExportComments$<text>  becomes //objectcomments <text>
+    # as PowerBuilder 2025 R2's own conversion does.
     $utf16 = $false
     if (Test-Prefix $Text ([string][char]0xFF + [char]0xFE)) {
         $u = [Text.Encoding]::Unicode.GetString($script:L1.GetBytes($Text), 2, $Text.Length - 2)
@@ -240,8 +241,7 @@ function Convert-Source([string]$Text, [string]$Path) {
         $line, $rest = Split-FirstLine $body
     }
     if (Test-Prefix $line '$PBExportComments$') {
-        if ((Get-Ext $Path) -eq '.srj') { $body = $rest }
-        else { $body = '//objectcomments ' + $line.Substring(18) + $rest }
+        $body = '//objectcomments ' + $line.Substring(18) + $rest
     }
     [pscustomobject]@{
         Text   = $(if ($bom) { $script:BOM + $body } else { $body })
@@ -261,7 +261,9 @@ function ConvertFrom-FileBytes([byte[]]$Bytes) {
 }
 
 function Read-PbSave([byte[]]$Bytes) {
-    # Parse a .pbw/.pbt ("Save Format v3.0") file.
+    # Parse a .pbw/.pbt ("Save Format v3.0") file. Values are unescaped
+    # (\\ -> \); section entries are kept raw, because PowerBuilder copies
+    # some of them into the .pbproj exactly as written.
     $values = New-Object 'System.Collections.Generic.Dictionary[string,string]'
     $sections = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[string]]'
     $current = $null
@@ -274,7 +276,7 @@ function Read-PbSave([byte[]]$Bytes) {
         }
         if ($line.StartsWith('@end')) { $current = $null; continue }
         if ($null -ne $current) {
-            if ($line -match '^\d+\s+"(.*)";?$') { $current.Add($Matches[1].Replace('\\', '\')) }
+            if ($line -match '^\d+\s+"(.*)";?$') { $current.Add($Matches[1]) }
             continue
         }
         if ($line -match '^(\w+)\s+"(.*)";?$') { $values[$Matches[1]] = $Matches[2].Replace('\\', '\') }
@@ -316,53 +318,41 @@ function Convert-Pbw([byte[]]$Bytes) {
     if ($default) { $out.Add('  <Projects Default="{0}">' -f (ConvertTo-XmlAttr (Set-Ext $default '.pbproj'))) }
     else { $out.Add('  <Projects>') }
     foreach ($t in (Get-PbSection $pb 'Targets')) {
-        $out.Add('    <Project Path="{0}"/>' -f (ConvertTo-XmlAttr (Set-Ext $t.Replace('/', '\') '.pbproj')))
+        $out.Add('    <Project Path="{0}"/>' -f (ConvertTo-XmlAttr (Set-Ext $t.Replace('\\', '\').Replace('/', '\') '.pbproj')))
     }
     $out.Add('  </Projects>')
     $out.Add('</Solution>')
     New-XmlFileBytes $out $eol
 }
 
-function Convert-Pbt([byte[]]$Bytes, [string]$SrjBase = $null) {
-    # .pbt -> .pbproj. With $SrjBase (the target's folder), a deploy project is
-    # kept only if its .srj file exists; without it, if its library is listed.
+function Convert-Pbt([byte[]]$Bytes) {
+    # .pbt -> .pbproj, in the layout PowerBuilder 2025 R2's conversion writes.
+    # Each entry of the target's Projects list ("<deploy>&<name>&<library>")
+    # becomes a <Deploying> element, copied as written in the .pbt (its
+    # library path keeps the doubled backslashes, as R2 leaves it).
     $pb = Read-PbSave $Bytes
     $eol = Get-Eol $script:L1.GetString($Bytes)
     $libs = @((Get-PbValue $pb 'LibList').Split(';') | Where-Object { $_ })
     $first = if ($libs.Count) { $libs[0] } else { '' }
     $applib = Get-PbValue $pb 'applib' $first
-    $deploys = New-Object System.Collections.Generic.List[object]
-    foreach ($item in (Get-PbSection $pb 'Projects')) {
-        $bits = $item.Split('&')
-        if ($bits.Length -lt 3) { continue }
-        $name = $bits[1]
-        $base = $bits[2].Replace('/', '\').Split('\')[-1].ToLowerInvariant()
-        $match = @($libs | Where-Object { $_.Replace('/', '\').Split('\')[-1].ToLowerInvariant() -eq $base })
-        if ($match.Count -eq 0) { continue }
-        $srj = $match[0] + '\' + $name + '.srj'
-        if (-not $SrjBase -or [IO.File]::Exists([IO.Path]::Combine($SrjBase, $srj))) {
-            $deploys.Add(@($name, $srj))
-        }
-    }
     $out = New-Object System.Collections.Generic.List[string]
     $out.Add('<?xml version="1.0" encoding="UTF-8" standalone="no" ?>')
     $out.Add('<Project>')
     $out.Add('  <Type Name="{0}"/>' -f (ConvertTo-XmlAttr (Get-PbValue $pb 'type' 'pb')))
     $out.Add('  <Application Name="{0}"/>' -f (ConvertTo-XmlAttr (Get-PbValue $pb 'appname')))
-    $od = 'OutputDirectory="Build\bin\$(ConfigurationName)"'
-    if ($deploys.Count) {
-        $out.Add("  <DeployConfigurations $od>")
-        foreach ($d in $deploys) {
-            $line = '    <DeployConfiguration Name="{0}" Path="{1}"/>' -f (ConvertTo-XmlAttr $d[0]), (ConvertTo-XmlAttr $d[1])
-            $out.Add($line)
-        }
-        $out.Add('  </DeployConfigurations>')
-    } else {
-        $out.Add("  <DeployConfigurations $od/>")
-    }
     $out.Add('  <Libraries AppEntry="{0}">' -f (ConvertTo-XmlAttr $applib))
     foreach ($l in $libs) { $out.Add('    <Library Path="{0}"/>' -f (ConvertTo-XmlAttr $l)) }
     $out.Add('  </Libraries>')
+    $deploys = @(Get-PbSection $pb 'Projects' | ForEach-Object { , $_.Split([char[]]@('&'), 3) } |
+                 Where-Object { $_.Length -eq 3 })
+    if ($deploys.Count) {
+        $out.Add('  <Deployings>')
+        foreach ($d in $deploys) {
+            $line = '    <Deploying Deploy="{0}" Library="{1}" Name="{2}"/>' -f (ConvertTo-XmlAttr $d[0]), (ConvertTo-XmlAttr $d[2]), (ConvertTo-XmlAttr $d[1])
+            $out.Add($line)
+        }
+        $out.Add('  </Deployings>')
+    }
     $out.Add('</Project>')
     New-XmlFileBytes $out $eol
 }
@@ -678,9 +668,8 @@ function Invoke-Inplace {
             $touched.Add($out)
         } elseif (Test-Suffix $p '.pbt') {
             $bytes = [IO.File]::ReadAllBytes([IO.Path]::Combine($repoPath, $p))
-            $base = [IO.Path]::GetDirectoryName([IO.Path]::Combine($repoPath, $p))
             $out = Set-Ext $p '.pbproj'
-            Write-RepoFile $repoPath $out (Convert-Pbt $bytes $base)
+            Write-RepoFile $repoPath $out (Convert-Pbt $bytes)
             $null = Invoke-Git $repoPath @('rm', '-q', '--', $p)
             $touched.Add($out)
         } elseif (Test-Gitignore $p) {

@@ -86,10 +86,9 @@ def convert_source(data, path):
 
     $PBExportHeader$<name>      is dropped
     $PBExportComments$<text>    becomes //objectcomments <text>
-                                (dropped for .srj project objects)
-    Everything else is kept byte for byte. Returns (bytes, notes)."""
+    Everything else is kept byte for byte, as PowerBuilder 2025 R2's own
+    conversion does. Returns (bytes, notes)."""
     notes = []
-    ext = os.path.splitext(path)[1].lower()
     if data.startswith(b"\xff\xfe"):        # UTF-16LE export -> UTF-8 with BOM
         data = BOM + data[2:].decode("utf-16-le").encode("utf-8")
         notes.append("utf16")
@@ -100,10 +99,7 @@ def convert_source(data, path):
         body = rest
         line, rest = _take_line(body)
     if line.startswith(b"$PBExportComments$"):
-        if ext == ".srj":
-            body = rest
-        else:
-            body = b"//objectcomments " + line[len(b"$PBExportComments$"):] + rest
+        body = b"//objectcomments " + line[len(b"$PBExportComments$"):] + rest
     if b"Start of PowerBuilder Binary Data Section" in body:
         notes.append("binary")
     return (BOM if bom else b"") + body, notes
@@ -127,7 +123,9 @@ def _pb_unescape(s):
 
 
 def parse_pb_save(data):
-    """Parse a .pbw/.pbt ("Save Format v3.0") file into (values, sections)."""
+    """Parse a .pbw/.pbt ("Save Format v3.0") file into (values, sections).
+    Values are unescaped (\\\\ -> \\); section entries are kept raw, because
+    PowerBuilder copies some of them into the .pbproj exactly as written."""
     values, sections, current = {}, {}, None
     for raw in _decode(data).splitlines():
         line = raw.strip()
@@ -141,7 +139,7 @@ def parse_pb_save(data):
         if current is not None:
             m = re.match(r'\d+\s+"(.*)";?$', line)
             if m:
-                current.append(_pb_unescape(m.group(1)))
+                current.append(m.group(1))
             continue
         m = re.match(r'(\w+)\s+"(.*)";?$', line)
         if m:
@@ -161,7 +159,7 @@ def _swap_ext(path, new_ext):
 def convert_pbw(data):
     values, sections = parse_pb_save(data)
     nl = _eol(data)
-    targets = [t.replace("/", "\\") for t in sections.get("Targets", [])]
+    targets = [_pb_unescape(t).replace("/", "\\") for t in sections.get("Targets", [])]
     default = values.get("DefaultTarget")
     out = ['<?xml version="1.0" encoding="UTF-8" standalone="no" ?>', "<Solution>"]
     if default:
@@ -174,42 +172,31 @@ def convert_pbw(data):
     return BOM + (nl.join(out) + nl).encode("utf-8")
 
 
-def convert_pbt(data, srj_exists=None):
-    """.pbt -> .pbproj. srj_exists(path_with_backslashes) -> bool, or None to
-    accept any project whose library is on the library list."""
+def convert_pbt(data):
+    """.pbt -> .pbproj, in the layout PowerBuilder 2025 R2's conversion writes.
+    Each entry of the target's Projects list ("<deploy>&<name>&<library>")
+    becomes a <Deploying> element, copied as written in the .pbt (its library
+    path keeps the doubled backslashes, as R2 leaves it)."""
     values, sections = parse_pb_save(data)
     nl = _eol(data)
     libs = [l for l in values.get("LibList", "").split(";") if l]
     applib = values.get("applib", libs[0] if libs else "")
-    deploys = []
-    for item in sections.get("Projects", []):
-        bits = item.split("&")
-        if len(bits) < 3:
-            continue
-        name, lib = bits[1], bits[2]
-        base = lib.replace("/", "\\").split("\\")[-1].lower()
-        match = [l for l in libs if l.replace("/", "\\").split("\\")[-1].lower() == base]
-        if not match:
-            continue
-        srj = match[0] + "\\" + name + ".srj"
-        if srj_exists is None or srj_exists(srj):
-            deploys.append((name, srj))
     out = ['<?xml version="1.0" encoding="UTF-8" standalone="no" ?>', "<Project>",
            '  <Type Name="%s"/>' % _xml_attr(values.get("type", "pb")),
-           '  <Application Name="%s"/>' % _xml_attr(values.get("appname", ""))]
-    od = 'OutputDirectory="Build\\bin\\$(ConfigurationName)"'
-    if deploys:
-        out.append("  <DeployConfigurations %s>" % od)
-        for name, srj in deploys:
-            out.append('    <DeployConfiguration Name="%s" Path="%s"/>'
-                       % (_xml_attr(name), _xml_attr(srj)))
-        out.append("  </DeployConfigurations>")
-    else:
-        out.append("  <DeployConfigurations %s/>" % od)
-    out.append('  <Libraries AppEntry="%s">' % _xml_attr(applib))
+           '  <Application Name="%s"/>' % _xml_attr(values.get("appname", "")),
+           '  <Libraries AppEntry="%s">' % _xml_attr(applib)]
     for l in libs:
         out.append('    <Library Path="%s"/>' % _xml_attr(l))
-    out += ["  </Libraries>", "</Project>"]
+    out.append("  </Libraries>")
+    deploys = [item.split("&", 2) for item in sections.get("Projects", [])]
+    deploys = [d for d in deploys if len(d) == 3]
+    if deploys:
+        out.append("  <Deployings>")
+        for deploy, name, lib in deploys:
+            out.append('    <Deploying Deploy="%s" Library="%s" Name="%s"/>'
+                       % (_xml_attr(deploy), _xml_attr(lib), _xml_attr(name)))
+        out.append("  </Deployings>")
+    out.append("</Project>")
     return BOM + (nl.join(out) + nl).encode("utf-8")
 
 
@@ -485,13 +472,8 @@ def run_inplace(args):
             touched.append(out)
         elif low.endswith(".pbt"):
             data = open(os.path.join(repo, p), "rb").read()
-            base = os.path.dirname(p)
-
-            def exists(srj, base=base):
-                rel = os.path.normpath(os.path.join(base, srj.replace("\\", "/")))
-                return os.path.isfile(os.path.join(repo, rel))
             out = _swap_ext(p, ".pbproj")
-            _write(repo, out, convert_pbt(data, exists))
+            _write(repo, out, convert_pbt(data))
             git(repo, "rm", "-q", "--", p)
             touched.append(out)
         elif is_gitignore(p):
