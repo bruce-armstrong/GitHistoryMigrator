@@ -62,8 +62,9 @@ Each object maps one to one, and only its first lines change:
 | `$PBExportHeader$pfc_n_cst_dwsrv.sru` | *(removed)* |
 | `$PBExportComments$PFC DataWindow service` | `//objectcomments PFC DataWindow service` |
 
-The comment line is dropped altogether for `.srj` project objects. The rest
-of each file is identical, byte for byte.
+The rest of each file is identical, byte for byte. This is the same
+conversion PowerBuilder 2025 R2 performs (see
+[PowerBuilder 2025 R2's own conversion](#powerbuilder-2025-r2s-own-conversion)).
 
 Git records no renames. It detects them by comparing content. So the tool
 moves the files in one commit, with no content changes (every move is an
@@ -84,6 +85,40 @@ history.
 
 Use `inplace` unless you specifically want the history to look as if the
 project had always been a solution.
+
+## PowerBuilder 2025 R2's own conversion
+
+PowerBuilder 2025 R2 can also keep the history when it converts a workspace
+that is in git. It `git mv`s each object from `ws_objects` into its `.pbl`
+folder, stages those moves, and leaves the converted content as unstaged
+changes for you to commit. Its converted files match this tool's output byte
+for byte, apart from the `.bin` files described under
+[Limitations](#limitations). Appeon also documents a manual procedure in
+[knowledge base article 4732](https://www.appeon.com/developers/get-help/knowledgebase/4732),
+which covers SVN as well.
+
+If you use R2's conversion:
+
+- **Commit in two steps.** First commit only what R2 staged (`git commit`,
+  without `git add`). Then `git add` the converted files and commit again.
+  If the moves and the content changes go into one commit, git must
+  recognize each rename by similarity, and small objects can fall below its
+  50% threshold and lose their history. In testing, 12 small structure
+  objects did.
+- **Make sure the PBLs hold only what's in git.** R2 converts the objects in
+  your PBLs, not in `ws_objects`. If the repository tracks binary `.pbl`
+  files, Connect to Workspace checks them out and rebuilding imports the
+  source into them without removing anything. Objects deleted from source
+  since the PBLs were last committed then come back as new files. Stop
+  tracking the PBLs first, or delete them before rebuilding.
+- **Fix the `.gitignore`.** R2 doesn't adjust patterns that match `.pbl`
+  (see [.gitignore and .pbl folders](#gitignore-and-pbl-folders)), and it
+  doesn't ignore its `.pb` build cache or the `_BackupFiles` folder.
+
+This tool adds: rewrite mode, unattended and bulk runs outside the IDE,
+conversion straight from what's in git, the two commits made for you on a
+new branch, and the `.gitignore` fix. R2 adds SVN support and the `.bin`
+files.
 
 ## Usage
 
@@ -113,8 +148,8 @@ run it as `powershell -ExecutionPolicy Bypass -File .\Migrate.ps1 ...`.
 ### Recommended: commit the IDE's own migration output on top
 
 PowerBuilder's migration knows things this tool can't recover from
-`ws_objects`: library comments, which live only in the binary PBL, and the
-`.bin` files for objects with OLE binary data. Migrate a copy of the
+`ws_objects`: the `.bin` files for objects with OLE binary data, and any
+library comments it carries over from the binary PBLs. Migrate a copy of the
 workspace in the IDE, then pass the folder it wrote:
 
 ```powershell
@@ -129,6 +164,12 @@ without regard to case, as PowerBuilder does (a `.pbsln` that says
 repository already uses. Build output and anything your `.gitignore` excludes
 are skipped, and the skipped files are listed. Since the renames are already
 in commit 1, the history still follows.
+
+The IDE converts what's in the PBLs, so this commit also adds any object
+that is in the PBLs but not in `ws_objects`. Make sure the PBLs you migrate
+were built from the current source alone (see
+[PowerBuilder 2025 R2's own conversion](#powerbuilder-2025-r2s-own-conversion)),
+and check this commit's list of added files.
 
 ### `.gitignore` and `.pbl` folders
 
@@ -153,7 +194,8 @@ conversion commit; in rewrite mode, every version of each `.gitignore` gets it.
    this commit because the new `.pbl` folders take their place.
 2. **Conversion.** The export headers are rewritten. Each `.pbw` becomes a
    `.pbsln` and each `.pbt` a `.pbproj`, with the default target, application,
-   library list and deploy projects carried over. Each library folder gets a
+   library list and deploy projects carried over, in the layout PowerBuilder
+   2025 R2 writes. Each library folder gets a
    `.pblmeta` file. A `.gitignore` that would hide the `.pbl` folders is
    fixed (see above).
 3. *(With `-IdeOutput` only.)* The IDE's files.
@@ -172,10 +214,8 @@ file sits where a new `.pbl` folder must go. Pass
   save each one in the IDE.
 - **Library comments.** These are stored only in the binary PBL, so a
   generated `.pblmeta` gets the IDE's default comment ("Created from Source
-  Control Refresh Operation"). `-IdeOutput` brings in the real ones.
-- **Generated `.pbproj` deploy configurations** are best effort. A project
-  is included when its `.srj` can be found in a library on the target's
-  library list. In rewrite mode this is decided from the library list alone.
+  Control Refresh Operation"). In testing, R2's conversion wrote the same
+  default for every library.
 - **Rewrite mode** writes `.pblmeta` files in each commit that touches a
   library. It doesn't remove them when a library is later deleted.
 - After the migration, the first IDE save of some objects may still change
@@ -189,12 +229,13 @@ file sits where a new `.pbl` folder must go. Pass
 source repositories were not modified. Results:
 
 - **Renames.** All 863 moves were detected as exact (100%) renames.
-- **Matches the IDE.** After conversion, 875 of 886 files in the `.pbl`
-  folders were identical to `PFC2025 - Solution`. The other 11 are 9
-  objects that were edited separately in each repository and 2 `.pblmeta`
-  files whose real library comments exist only in the binary PBL.
-- **With `-IdeOutput`.** The final tree matched the Solution repository's
-  971 files exactly.
+- **Matches PowerBuilder 2025 R2.** On a later commit of the same project
+  (195 commits, 854 objects), R2's own conversion and this tool's output
+  were byte-identical for 885 of 886 files: every object, `.pbsln`,
+  `.pbproj` and `.pblmeta`. The exception is the one object with OLE
+  binary data, which R2 splits into a `.bin` file.
+- **With `-IdeOutput`.** The final tree matched the 971 files of the
+  IDE-converted `PFC2025 - Solution` exactly.
 - **Rewrite.** The tip tree is identical to the in-place result. The 185
   commits and 3 tags are kept. `git blame` credits no line to the migration,
   and `git fsck` passes.
